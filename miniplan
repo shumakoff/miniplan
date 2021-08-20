@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+import time
+import base64
+import re
+import redis
+import psycopg2
+
+# Settings
+MEGAPLAN_HOST = '127.0.0.1'
+CRITICAL_MASS = 23
+TIME_RANGE = 25 # what records consider "online"
+FILE = '/tmp/uids.txt'
+DEBUG = True
+
+
+def vprint(msg):
+    if DEBUG:
+        print(msg)
+
+def main():
+    active_users = count_dracula()
+    vprint('Active users: %d' % len(active_users))
+    if len(active_users) >= CRITICAL_MASS:
+        # reaching the limit
+        uid = get_offending_id(active_users)
+        logoff_user(uid)
+    else:
+        with open(FILE, 'w') as tmp:
+            tmp.write('')
+            tmp.flush()
+
+def count_dracula():
+    redis_conn = redis.StrictRedis(host=MEGAPLAN_HOST, port=6379, db=0)
+    itemset = redis_conn.hgetall('localhost')
+    timenow = int(time.time())
+    timeold = timenow - TIME_RANGE
+    active_users = []
+    for key, value in itemset.iteritems():
+        if int(value) > timeold:
+            active_users.append(int(key))
+
+    return active_users
+
+def get_offending_id(active_users):
+    # check table for idle users
+    # user also must be in active_users
+    conn = psycopg2.connect(host=MEGAPLAN_HOST,
+                            password='postgres',
+                            user='postgres',
+                            database='megaplan')
+    cur = conn.cursor()
+    # get all sessions
+    cur.execute('select uniq_id, data from sdf.session order by uniq_id desc')
+    all_sessions = dict(cur.fetchall())
+    active_sessions = {}
+    for uniq_id in all_sessions.iterkeys():
+        # filter sessions
+        auth_id = get_authid(base64.decodestring(all_sessions[uniq_id]))
+        if auth_id:
+            cur.execute('select user_id \
+                            from sdf.perm_auth \
+                            where auth_id = %s' % auth_id)
+            auth_id = cur.fetchone()[0]
+            if auth_id in active_users:
+                active_sessions[uniq_id] = auth_id
+
+
+    unique_ids = []
+
+    # look for active record with oldest id_updated
+    for user in active_users:
+        for key in active_sessions.keys():
+            if active_sessions[key] == user:
+                if str(key) not in unique_ids:
+                    unique_ids.append(str(key))
+
+    # filter by login time
+    cur.execute('select param1, key \
+                    from sdf.perm_auth \
+                    where user_id in (%s) ' % (
+                        ','.join(str(x) for x in active_users)))
+    fake_ids = cur.fetchall()
+    for fake_id in fake_ids[:]:
+        if fake_id[0] in ['', '0', '1', '3', '16', '38f14555407d92e', 'a2c0e0354ead68d7']:
+            fake_ids.pop(fake_ids.index(fake_id))
+    vprint('Fake IDs: ')
+    vprint(fake_ids)
+    cur.execute('select uniq_id, valid_to \
+                    from sdf.cookie \
+                    where uniq_id in (%s) \
+                    order by valid_to asc \
+                    limit 1' % (
+                        ','.join(x[0] for x in fake_ids)))
+    oldest_cookie = cur.fetchall()
+    vprint('Oldest cookie: ')
+    vprint(oldest_cookie)
+    cur.execute('select user_id \
+                    from sdf.perm_auth \
+                    where param1 = %s::text \
+                    and class = \'SdfPermMiddleware_PasswordAuth\' \
+                    limit 1' % oldest_cookie[0][0])
+    kill_id = cur.fetchone()[0]
+    vprint('Kill id: %d' % kill_id)
+
+    conn.close()
+
+    return kill_id
+
+
+def get_authid(serialized):
+    try:
+        auth_id = re.search('"authId";i:(?P<usrid>\d+)', serialized).groupdict()['usrid']
+    except AttributeError as error:
+        auth_id = None
+    return auth_id
+
+def logoff_user(uid):
+    conn = psycopg2.connect(host=MEGAPLAN_HOST,
+                            password='postgres',
+                            user='postgres',
+                            database='megaplan')
+    cur = conn.cursor()
+    cur.execute('select key from sdf.perm_auth where user_id = %s' % uid)
+    vprint('Oldest logged in user id: %s, login %s' % (uid, cur.fetchone()[0]))
+    with open(FILE, 'w') as tmp:
+        tmp.write(str(uid))
+        tmp.flush()
+
+if __name__ == '__main__':
+    main()
+
